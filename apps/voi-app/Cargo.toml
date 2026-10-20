@@ -1,0 +1,82 @@
+[package]
+name = "voi-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# NOT "Voi": APFS is case-insensitive by default, so that output path is the
+# same file as the CLI's "voi" and cargo silently overwrites one with the
+# other. The bundle installs this binary under the display name.
+[[bin]]
+name = "voi-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+voi-audio = { path = "../../crates/voi-audio" }
+voi-core = { path = "../../crates/voi-core" }
+voi-soniox = { path = "../../crates/voi-soniox" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSTimer", "NSDate", "NSRunLoop", "NSRunLoop", "NSURL", "NSObject", "NSThread", "NSAttributedString", "NSDictionary", "NSValue", "NSRange", "NSKeyValueCoding", "NSBundle", "NSError", "NSData"] }
+objc2-quartz-core = { version = "0.3", features = [
+    "CALayer", "CAShapeLayer", "CAGradientLayer", "CAAnimation", "CAMediaTiming", "CAMediaTimingFunction",
+    "CATransaction", "objc2-core-foundation",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGPath", "CGColor",
+    # Reading whether the dictation key is down, and pressing ⌘V afterwards.
+    "CGEvent", "CGEventTypes", "CGEventSource", "CGRemoteOperation", "CGError",
+] }
+objc2-core-image = { version = "0.3", features = ["CIFilter"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
+    "NSMenu", "NSMenuItem", "NSResponder", "NSControl", "NSButton",
+    "NSView", "NSWorkspace", "NSRunningApplication",
+    "NSPanel", "NSWindow", "NSColor", "NSBezierPath", "NSTextField",
+    "NSGraphicsContext", "NSFont", "NSScreen", "NSEvent", "NSImage",
+    "NSParagraphStyle", "NSGraphics", "NSCell", "NSText",
+    "NSTrackingArea", "NSPasteboard", "NSCursor", "NSScrollView", "NSTextView",
+    "NSClipView", "NSLayoutManager", "NSTextContainer",
+    "NSVisualEffectView", "NSAttributedString", "NSStringDrawing", "NSGradient",
+    "NSSecureTextField", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSTokenField",
+    "NSPopUpButton", "NSSlider", "NSAccessibilityConstants", "NSSound",
+    # The settings window: toolbar tabs, rounded groups, switches.
+    "NSTabViewController", "NSTabViewItem", "NSTabView", "NSViewController", "NSBox",
+    "NSSwitch", "NSFontDescriptor", "NSToolbar", "NSLayoutConstraint",
+    # Drawing windows into PNGs for --screenshots, without showing them.
+    "NSBitmapImageRep", "NSImageRep",
+] }
+
+# The Windows front end: egui for the HUD and Settings, a tray icon for the
+# menu, Win32 directly for the keyboard hook, window styles and the Run key.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = "0.26"
+rfd = "0.17"
+winreg = "0.56"
+png = "0.18"
+raw-window-handle = "0.6"
+mslnk = "0.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_System_Console",
+    "Win32_Storage_Xps", "Win32_UI_Input", "Win32_System_DataExchange",
+    "Win32_System_Memory", "Win32_Media", "Win32_Media_Audio",
+] }
+
+# Voi.exe's icon (assets/voi.ico, the Mac's), compiled in as a resource.
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+voi-scan = { path = "../../crates/voi-scan" }
+# The side-by-side comparison of the Mac's and Windows' screenshots.
+png = "0.18"

@@ -1,0 +1,15 @@
+[package]
+name = "voi-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fails a build whose artifact carries a Soniox key"
+
+[[bin]]
+name = "voi-scan"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+voi-core = { path = "../voi-core" }
+zip = { version = "9", default-features = false, features = ["deflate"] }

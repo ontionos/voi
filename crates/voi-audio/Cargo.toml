@@ -1,0 +1,39 @@
+[package]
+name = "voi-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+cpal = "0.18"
+hound = "3.5"
+ringbuf = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-core-audio = { version = "0.3", features = [
+    "std", "objc2", "block2", "dispatch2", "objc2-foundation",
+    "objc2-core-audio-types", "AudioHardware",
+] }
+objc2-core-audio-types = "0.3"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSDictionary", "NSValue", "NSUUID", "NSObject"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase", "CFString", "CFDictionary", "CFArray", "CFUUID", "CFNumber"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+# Which programs are running, to tell a microphone in use from a stale record.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"

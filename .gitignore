@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+/target
+node_modules/
+.DS_Store
+__pycache__/

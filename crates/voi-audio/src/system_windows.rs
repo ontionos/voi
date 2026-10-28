@@ -12,7 +12,7 @@
 //! interleaved in the wrong order. A filler thread therefore tops the stream
 //! up with silence whenever it falls behind the wall clock; see [`owed`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,15 +56,45 @@ fn name_of(device: &cpal::Device) -> Option<String> {
 }
 
 impl SystemSource {
-    /// Capture what the default output device is playing.
+    /// Capture what the default output device is playing, for as long as the
+    /// stream lives — opened again on whatever the output device is now when
+    /// the one it captured goes away or fails (see [`crate::supervise`]).
     ///
     /// `VOI_LOOPBACK_DEVICE` names another output device instead. Tests use it
     /// to play speech into an output nobody listens to and record it back,
     /// with nothing coming out of the speakers.
     pub fn start() -> Result<AudioStream> {
+        crate::supervise::supervise(Windows, crate::supervise::Timing::default())
+    }
+}
+
+/// The output device named in `VOI_LOOPBACK_DEVICE`, if one is.
+fn wanted() -> Option<String> {
+    std::env::var("VOI_LOOPBACK_DEVICE").ok().filter(|s| !s.is_empty())
+}
+
+/// How the supervisor opens the loopback and asks what the output device is.
+struct Windows;
+
+impl crate::supervise::Platform for Windows {
+    fn open(&mut self) -> Result<crate::supervise::Opened> {
+        open()
+    }
+
+    /// The default output device's name. A named test device is never
+    /// followed elsewhere.
+    fn current_device(&mut self) -> Option<String> {
+        if wanted().is_some() {
+            return None;
+        }
+        cpal::default_host().default_output_device().as_ref().and_then(name_of)
+    }
+}
+
+fn open() -> Result<crate::supervise::Opened> {
+    {
         let host = cpal::default_host();
-        let wanted = std::env::var("VOI_LOOPBACK_DEVICE").ok().filter(|s| !s.is_empty());
-        let device = match wanted {
+        let device = match wanted() {
             Some(name) => host
                 .output_devices()?
                 .find(|d| name_of(d).is_some_and(|n| n == name))
@@ -77,7 +107,10 @@ impl SystemSource {
         let sample_rate = config.sample_rate();
         let channels = config.channels();
         let format = config.sample_format();
-        info!(device = name_of(&device).as_deref().unwrap_or("?"), sample_rate, channels, ?format, "opening system audio loopback");
+        let device_name = name_of(&device).unwrap_or_else(|| "?".into());
+        info!(device = %device_name, sample_rate, channels, ?format, "opening system audio loopback");
+        let failed = Arc::new(AtomicBool::new(false));
+        let failed_cb = failed.clone();
 
         let (tx, rx) = mpsc::channel::<AudioChunk>(64);
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -87,7 +120,7 @@ impl SystemSource {
         let thread = std::thread::Builder::new()
             .name("voi-loopback".into())
             .spawn(move || {
-                let stream = build(&device, &config.into(), format, tx.clone(), delivered.clone(), sample_rate, channels);
+                let stream = build(&device, &config.into(), format, tx.clone(), delivered.clone(), sample_rate, channels, failed_cb);
                 let stream = match stream.and_then(|s| s.play().map(|_| s).map_err(Into::into)) {
                     Ok(s) => s,
                     Err(e) => {
@@ -121,7 +154,8 @@ impl SystemSource {
 
         ready_rx.recv().context("loopback thread died during startup")??;
         let guard = Guard { stop: Some(stop_tx), thread: Some(thread) };
-        Ok(AudioStream::new(rx, sample_rate, channels, Box::new(guard)))
+        let stream = AudioStream::new(rx, sample_rate, channels, Box::new(guard));
+        Ok(crate::supervise::Opened { stream, device: device_name, failed, check: None })
     }
 }
 
@@ -133,11 +167,18 @@ fn build(
     delivered: Arc<AtomicU64>,
     sample_rate: u32,
     channels: u16,
+    failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream> {
-    let err_fn = |e| warn!(error = %e, "system audio stream error");
     macro_rules! stream_for {
         ($t:ty) => {{
             let tx = tx.clone();
+            let failed = failed.clone();
+            // An error here — the device unplugged, switched off, taken
+            // away — ends this capture; the supervisor opens a new one.
+            let err_fn = move |e| {
+                warn!(error = %e, "system audio stream error");
+                failed.store(true, Ordering::Release);
+            };
             let delivered = delivered.clone();
             device.build_input_stream(
                 config.clone(),

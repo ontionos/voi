@@ -14,6 +14,8 @@ mod file;
 mod mic;
 pub mod permissions;
 pub mod resample;
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+mod supervise;
 pub mod watch;
 pub mod wav;
 

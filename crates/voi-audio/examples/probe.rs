@@ -1,7 +1,9 @@
 //! Counts chunks from each capture source. Isolates capture from everything downstream.
 //!
 //! Run from inside the signed bundle so TCC has an identity to grant against:
-//!   cargo build --release --example probe && ./target/release/examples/probe
+//!   cargo build --release --example probe && ./target/release/examples/probe [mic|system]
+//!
+//! With an argument only that source is opened.
 
 use std::time::Duration;
 
@@ -9,7 +11,11 @@ use std::time::Duration;
 async fn main() {
     tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).init();
 
+    let only = std::env::args().nth(1);
     for name in ["mic", "system"] {
+        if only.as_deref().is_some_and(|o| o != name) {
+            continue;
+        }
         let stream = match name {
             "mic" => voi_audio::MicSource::start(),
             _ => voi_audio::SystemSource::start(),

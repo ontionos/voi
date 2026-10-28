@@ -180,9 +180,15 @@ which a bare CLI binary does not have. Confirmed and handled: `scripts/bundle.sh
 wraps the binary in a minimal ad-hoc-signed `.app`. Re-signing changes the TCC
 identity, so macOS re-prompts after a rebuild.
 
-**The tap's sample rate can change mid-session** if the user switches output
-device, while Soniox is told the rate once at connect. Currently logged as a
-warning; Phase 2 should reconnect the affected stream instead.
+**The system capture is tied to the output device it opened on.** When that
+device goes away mid-call (AirPods dropping out, headphones unplugged), the
+capture dies with it, silently: on 2026-10-28 a call lost the other side for
+its last fourteen minutes. `voi-audio/src/supervise.rs` now watches the stream
+and opens it again on the current output device when it stops delivering for
+2 s, when the default output changes, when the device reports an error, or (on
+the Mac) when the device it is clocked by is no longer alive. Silence fills
+the outage so the transcript's clock does not slip. A changed sample rate is
+followed by the recorder.
 
 **meetily's Windows system audio path is not usable.** Its WASAPI references are
 device-name string matching for Bluetooth detection only; actual capture calls

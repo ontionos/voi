@@ -28,7 +28,7 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
     kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
-    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceUID,
+    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyDeviceUID,
     kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
     kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioSubTapUIDKey,
     kAudioTapPropertyFormat, AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID,
@@ -60,6 +60,59 @@ type IoBlock = RcBlock<
         NonNull<objc2_core_audio_types::AudioTimeStamp>,
     ),
 >;
+
+/// The default output device now: its id and its UID. A device that drops
+/// out and comes back keeps its UID but gets a new id.
+unsafe fn default_output() -> Result<(AudioObjectID, String)> {
+    let output_id: AudioObjectID =
+        get_prop(kAudioObjectSystemObject as AudioObjectID, kAudioHardwarePropertyDefaultOutputDevice)
+            .map_err(|e| anyhow!("no default output device: {e}"))?;
+    let output_uid_cf: *const CFString = get_prop(output_id, kAudioDevicePropertyDeviceUID)?;
+    let output_uid = NonNull::new(output_uid_cf as *mut CFString)
+        .ok_or_else(|| anyhow!("output device has no UID"))?
+        .as_ref()
+        .to_string();
+    Ok((output_id, output_uid))
+}
+
+/// Whether Core Audio still has `device`. A device that went away answers
+/// no, or not at all.
+fn alive(device: AudioObjectID) -> bool {
+    unsafe { get_prop::<u32>(device, kAudioDevicePropertyDeviceIsAlive).map(|v| v != 0).unwrap_or(false) }
+}
+
+/// How the supervisor opens the tap and asks what the output device is.
+struct Mac;
+
+impl crate::supervise::Platform for Mac {
+    fn open(&mut self) -> Result<crate::supervise::Opened> {
+        unsafe {
+            let (id, uid) = default_output()?;
+            let (stream, aggregate) = SystemSource::start_inner(&uid)?;
+            // The output device the tap is clocked by, and the tap's own
+            // device: when either dies — AirPods dropping out — so does the
+            // capture, whatever it still delivers.
+            let check = move || {
+                for (what, device) in [("the output device", id), ("the tap's aggregate device", aggregate)] {
+                    if !alive(device) {
+                        return Some(format!("{what} ({device}) is gone"));
+                    }
+                }
+                None
+            };
+            Ok(crate::supervise::Opened {
+                stream,
+                device: format!("{uid}#{id}"),
+                failed: Default::default(),
+                check: Some(Box::new(check)),
+            })
+        }
+    }
+
+    fn current_device(&mut self) -> Option<String> {
+        unsafe { default_output().ok().map(|(id, uid)| format!("{uid}#{id}")) }
+    }
+}
 
 /// Roughly 2.7s of headroom at 48kHz — enough to ride out a scheduling hiccup
 /// without letting a stalled consumer grow memory without bound.
@@ -126,23 +179,15 @@ fn key(k: &std::ffi::CStr) -> Retained<NSString> {
 }
 
 impl SystemSource {
+    /// Capture everything the Mac plays, for as long as the stream lives —
+    /// opened again on whatever the output device is now whenever the one it
+    /// was clocked by goes away (see [`crate::supervise`]).
     pub fn start() -> Result<AudioStream> {
-        unsafe { Self::start_inner() }
+        crate::supervise::supervise(Mac, crate::supervise::Timing::default())
     }
 
-    unsafe fn start_inner() -> Result<AudioStream> {
-        // 1. Identify the current default output device — the tap follows it.
-        let output_id: AudioObjectID = get_prop(
-            kAudioObjectSystemObject as AudioObjectID,
-            kAudioHardwarePropertyDefaultOutputDevice,
-        )
-        .map_err(|e| anyhow!("no default output device: {e}"))?;
-
-        let output_uid_cf: *const CFString = get_prop(output_id, kAudioDevicePropertyDeviceUID)?;
-        let output_uid = NonNull::new(output_uid_cf as *mut CFString)
-            .ok_or_else(|| anyhow!("output device has no UID"))?
-            .as_ref()
-            .to_string();
+    /// The tap on the device `output_uid`, and the aggregate device holding it.
+    unsafe fn start_inner(output_uid: &str) -> Result<(AudioStream, AudioObjectID)> {
 
         // 2. A mono tap of every process. Mono is both what we want for speech
         //    and the more reliable configuration on macOS.
@@ -281,7 +326,7 @@ impl SystemSource {
             tap,
             _block: block,
         };
-        Ok(AudioStream::new(rx, sample_rate, channels, Box::new(guard)))
+        Ok((AudioStream::new(rx, sample_rate, channels, Box::new(guard)), device))
     }
 }
 

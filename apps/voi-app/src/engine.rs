@@ -212,6 +212,53 @@ pub fn transcribe(
     });
 }
 
+/// Transcribe the recordings chosen: one goes through [`transcribe`] as
+/// before; several become one document, a section per recording.
+pub fn transcribe_many(
+    shared: &Shared,
+    key: String,
+    root: PathBuf,
+    mut paths: Vec<PathBuf>,
+    done: impl FnOnce(PathBuf) + Send + 'static,
+) {
+    if paths.len() <= 1 {
+        if let Some(path) = paths.pop() {
+            transcribe(shared, key, root, path, done);
+        }
+        return;
+    }
+    let shared = shared.clone();
+    let total = paths.len();
+    shared.lock().unwrap().job = Some(format!("Transcribing {total} recordings"));
+    tracing::info!(total, "batch transcription");
+
+    runtime().spawn(async move {
+        let reporter = shared.clone();
+        let progress = move |finished: usize, total: usize| {
+            if let Ok(mut s) = reporter.lock() {
+                s.job = Some(format!("Transcribing {total} recordings: {finished} done"));
+            }
+        };
+        match voi_core::transcribe_files(&paths, &key, &root, progress).await {
+            Ok(out) => {
+                tracing::info!(path = %out.display(), total, "batch transcribed");
+                {
+                    let mut s = shared.lock().unwrap();
+                    s.job = None;
+                    s.last_transcript = Some(out.clone());
+                }
+                done(out);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "batch transcription failed");
+                let mut s = shared.lock().unwrap();
+                s.job = None;
+                s.error = Some(format!("{e:#}"));
+            }
+        }
+    });
+}
+
 /// Soniox reports no percentage, and a running clock only answers "how long
 /// has this taken", which is not the question. The question is whether it is
 /// still alive — the spinner beside this text answers that.

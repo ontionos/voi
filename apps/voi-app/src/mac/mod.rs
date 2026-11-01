@@ -131,20 +131,27 @@ define_class!(
             let Ok(root) = Session::default_root() else { return };
 
             let panel = NSOpenPanel::openPanel(mtm);
-            panel.setAllowsMultipleSelection(false);
+            // Several at once become one document, a section each.
+            panel.setAllowsMultipleSelection(true);
             panel.setCanChooseDirectories(false);
-            panel.setMessage(Some(ns_string!("Choose a recording to transcribe")));
+            panel.setMessage(Some(ns_string!("Choose recordings to transcribe — several go into one document")));
             NSApplication::sharedApplication(mtm).activate();
             if panel.runModal() != NSModalResponseOK {
                 return;
             }
-            let Some(url) = panel.URL() else { return };
-            let Some(path) = url.path() else { return };
-            let path = std::path::PathBuf::from(path.to_string());
+            let paths: Vec<std::path::PathBuf> = panel
+                .URLs()
+                .iter()
+                .filter_map(|url| url.path())
+                .map(|p| std::path::PathBuf::from(p.to_string()))
+                .collect();
+            if paths.is_empty() {
+                return;
+            }
 
             // Reveal rather than open: it shows the folder *and* the file, so
             // either is one click away.
-            crate::engine::transcribe(&shared, key, root, path, |out| reveal(&out));
+            crate::engine::transcribe_many(&shared, key, root, paths, |out| reveal(&out));
         }
 
         #[unsafe(method(openSettings:))]

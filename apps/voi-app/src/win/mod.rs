@@ -392,15 +392,16 @@ impl App {
             }
         };
         let Ok(root) = voi_core::Session::default_root() else { return };
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Choose a recording to transcribe")
+        // Several at once become one document, a section each.
+        let Some(paths) = rfd::FileDialog::new()
+            .set_title("Choose recordings to transcribe — several go into one document")
             .add_filter("Audio", &["wav", "mp3", "m4a", "ogg", "opus", "flac", "aac", "webm", "mp4", "wma", "amr"])
             .add_filter("All files", &["*"])
-            .pick_file()
+            .pick_files()
         else {
             return;
         };
-        crate::engine::transcribe(&self.shared, key, root, path, |out| reveal(&out));
+        crate::engine::transcribe_many(&self.shared, key, root, paths, |out| reveal(&out));
     }
 
     /// What the dictation key just did, by the same rule as the Mac's.

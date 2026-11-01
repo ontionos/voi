@@ -19,7 +19,7 @@ mod segment;
 pub mod update;
 pub use recorder::{
     api_key_path, find_api_key, load_overlay_position, save_api_key, save_overlay_position,
-    transcribe_file, spawn as spawn_recorder, Recorder, RecorderConfig, RecorderEvent, Stopper,
+    transcribe_file, transcribe_files, spawn as spawn_recorder, Recorder, RecorderConfig, RecorderEvent, Stopper,
 };
 pub use segment::{Attribution, SegmentBuilder};
 
@@ -154,6 +154,26 @@ impl Session {
         if let Some(lang) = &seg.language {
             *self.languages.entry(lang.clone()).or_default() += 1;
         }
+        Ok(())
+    }
+
+    /// Start a section — one recording of several in a batch — under its own
+    /// heading. The speaker shown before it does not carry over.
+    pub fn section(&mut self, title: &str) -> Result<()> {
+        use std::io::Write;
+        writeln!(self.transcript, "\n## {title}\n")?;
+        self.transcript.flush()?;
+        self.last_speaker = None;
+        Ok(())
+    }
+
+    /// A line of plain text in the transcript: what happened to a recording
+    /// that could not be transcribed, say.
+    pub fn note(&mut self, text: &str) -> Result<()> {
+        use std::io::Write;
+        writeln!(self.transcript, "{text}")?;
+        self.transcript.flush()?;
+        self.last_speaker = None;
         Ok(())
     }
 

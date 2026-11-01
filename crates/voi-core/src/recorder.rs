@@ -833,6 +833,111 @@ pub async fn transcribe_file(
     Ok(path)
 }
 
+/// How many recordings of a batch go to Soniox at once.
+const BATCH_AT_ONCE: usize = 3;
+
+/// Transcribe several recordings into one document: a section per recording,
+/// headed by its file name, in the order of their names (`2.mp3` before
+/// `10.mp3`). They are sent [`BATCH_AT_ONCE`] at a time, and the document is
+/// written once all are back. One that fails gets a line saying why, and the
+/// rest go on; only if none can be transcribed is it an error.
+///
+/// `on_progress(finished, total)` is called as each one comes back.
+pub async fn transcribe_files(
+    paths: &[PathBuf],
+    api_key: &str,
+    root: &std::path::Path,
+    on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
+) -> Result<PathBuf> {
+    let prefs = crate::prefs::load();
+    let languages = if prefs.languages.is_empty() { crate::prefs::default_languages() } else { prefs.languages };
+    let terms = prefs.terms;
+    let mut paths = paths.to_vec();
+    paths.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)));
+    let total = paths.len();
+
+    let on_progress = std::sync::Arc::new(on_progress);
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(BATCH_AT_ONCE));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, path) in paths.iter().cloned().enumerate() {
+        let (key, languages, terms) = (api_key.to_string(), languages.clone(), terms.clone());
+        let (gate, finished, on_progress) = (gate.clone(), finished.clone(), on_progress.clone());
+        tasks.spawn(async move {
+            let _turn = gate.acquire_owned().await;
+            let tokens = voi_soniox::file::transcribe(&path, &key, &languages, &terms, |_| {}).await;
+            if let Err(e) = &tokens {
+                tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "a recording of the batch failed");
+            }
+            on_progress(finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1, total);
+            (i, tokens)
+        });
+    }
+    let mut results: Vec<Option<Result<Vec<voi_soniox::Token>>>> = (0..total).map(|_| None).collect();
+    while let Some(done) = tasks.join_next().await {
+        let (i, tokens) = done?;
+        results[i] = Some(tokens);
+    }
+
+    let sections: Vec<(String, Result<Vec<voi_soniox::Token>>)> = paths
+        .iter()
+        .zip(results)
+        .map(|(path, r)| {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            (name, r.unwrap_or_else(|| Err(anyhow::anyhow!("never came back"))))
+        })
+        .collect();
+    if let Some(first) = sections.iter().find_map(|(_, r)| r.as_ref().err()).filter(|_| sections.iter().all(|(_, r)| r.is_err())) {
+        anyhow::bail!("none of the {total} recordings could be transcribed: {first:#}");
+    }
+    let mut session = Session::create(root)?;
+    write_sections(&mut session, sections)?;
+    let path = session.path.clone();
+    session.finish()?;
+    Ok(path)
+}
+
+/// One section per recording: its name as the heading, then its lines, each
+/// with its own speakers and clock.
+fn write_sections(session: &mut Session, sections: Vec<(String, Result<Vec<voi_soniox::Token>>)>) -> Result<()> {
+    for (name, tokens) in sections {
+        session.section(&name)?;
+        match tokens {
+            Ok(tokens) => {
+                let mut builder = SegmentBuilder::diarized();
+                for seg in builder.push(tokens) {
+                    session.append(&seg)?;
+                }
+                if let Some(seg) = builder.flush() {
+                    session.append(&seg)?;
+                }
+            }
+            Err(e) => session.note(&format!("_Could not be transcribed: {e:#}_"))?,
+        }
+    }
+    Ok(())
+}
+
+/// A file name compared as people read it: runs of digits by their value.
+fn natural_key(path: &std::path::Path) -> Vec<(String, u64)> {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let mut key = Vec::new();
+    let (mut text, mut digits) = (String::new(), String::new());
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            if !digits.is_empty() {
+                key.push((std::mem::take(&mut text), digits.parse().unwrap_or(u64::MAX)));
+                digits.clear();
+            }
+            text.push(c);
+        }
+    }
+    key.push((text, digits.parse().unwrap_or(0)));
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::{interleaved, loudness};
@@ -884,6 +989,38 @@ mod tests {
         // And with nothing open on the other side, nothing is invented.
         assert_eq!(interleaved(vec![line("alone", 0)], None).len(), 1);
         assert!(interleaved(Vec::new(), None).is_empty());
+    }
+
+    #[test]
+    fn batch_files_go_in_the_order_people_read_their_names() {
+        use std::path::PathBuf;
+        let mut names: Vec<PathBuf> = ["10.mp3", "2.mp3", "Call B.m4a", "1.mp3", "call a.m4a"].iter().map(PathBuf::from).collect();
+        names.sort_by(|a, b| super::natural_key(a).cmp(&super::natural_key(b)));
+        let names: Vec<&str> = names.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(names, ["1.mp3", "2.mp3", "10.mp3", "call a.m4a", "Call B.m4a"]);
+    }
+
+    #[test]
+    fn a_batch_is_one_document_with_a_section_per_recording() {
+        let dir = std::env::temp_dir().join(format!("voi-batch-{}", uuid::Uuid::new_v4()));
+        let mut session = crate::Session::create(&dir).unwrap();
+        let sections = vec![
+            ("first.m4a".to_string(), Ok(vec![token("Hello there.", 0, 900)])),
+            ("second.m4a".to_string(), Err(anyhow::anyhow!("unsupported format"))),
+            ("third.m4a".to_string(), Ok(vec![token("Bye now.", 1_000, 1_800)])),
+        ];
+        super::write_sections(&mut session, sections).unwrap();
+        let path = session.path.clone();
+        session.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let first = text.find("## first.m4a").expect("first heading");
+        let second = text.find("## second.m4a").expect("second heading");
+        let third = text.find("## third.m4a").expect("third heading");
+        assert!(first < second && second < third, "{text}");
+        assert!(text[first..second].contains("Hello there."), "{text}");
+        assert!(text[second..third].contains("Could not be transcribed: unsupported format"), "{text}");
+        assert!(text[third..].contains("Bye now."), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

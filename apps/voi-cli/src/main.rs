@@ -41,8 +41,12 @@ enum Command {
     Sessions,
     /// Print a stored transcript.
     Show { id: String },
-    /// Transcribe an existing recording — a dictaphone file, a voice memo.
-    Transcribe { path: PathBuf },
+    /// Transcribe existing recordings — dictaphone files, voice memos. Several
+    /// go into one document, a section each, in the order of their names.
+    Transcribe {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
     /// Store the Soniox key, read from standard input so it never sits in the
     /// shell's history or on screen: `voi key < key.txt`.
     Key,
@@ -84,7 +88,8 @@ async fn main() -> Result<()> {
         }
         Command::Sessions => sessions(),
         Command::Show { id } => show(&id),
-        Command::Transcribe { path } => transcribe(&path).await,
+        Command::Transcribe { paths } if paths.len() == 1 => transcribe(&paths[0]).await,
+        Command::Transcribe { paths } => transcribe_many(&paths).await,
         Command::Repair { id } => repair(id.as_deref()),
         Command::Key => key(),
     }
@@ -116,6 +121,15 @@ async fn transcribe(path: &std::path::Path) -> Result<()> {
         Progress::Done => {}
     })
     .await?;
+    println!("{}", out.display());
+    Ok(())
+}
+
+async fn transcribe_many(paths: &[PathBuf]) -> Result<()> {
+    let key = find_api_key()?;
+    let root = Session::default_root()?;
+    println!("transcribing {} recordings…", paths.len());
+    let out = voi_core::transcribe_files(paths, &key, &root, |finished, total| println!("{finished} of {total} done")).await?;
     println!("{}", out.display());
     Ok(())
 }

@@ -16,6 +16,13 @@ use voi_core::Stopper;
 /// complete regardless — that is what it is for.
 const VIEW_LINES: usize = 200;
 
+/// The panel's window onto the history moves in steps of this many lines
+/// rather than one line at a time: it shows between [`VIEW_LINES`] and this
+/// many more. Dropping the oldest line with every new one meant rebuilding
+/// the panel's text on every line of a long call — what made it jerk and
+/// flicker as words arrived, once a call was past two hundred lines.
+const TRIM_STEP: usize = 50;
+
 /// Upper bound on retained lines. Deliberately huge: the panel scrolls, and a
 /// long call must not silently lose its beginning. At roughly 80 bytes a line
 /// this is a few megabytes — nothing next to the audio.
@@ -370,7 +377,8 @@ impl State {
     /// answering, and from the outside that is an app that died.
     fn runs(&self, keep: usize) -> Vec<(String, bool)> {
         let mut runs: Vec<(String, bool)> = Vec::new();
-        let from = self.lines.len().saturating_sub(keep);
+        let over = self.lines.len().saturating_sub(keep);
+        let from = (over / TRIM_STEP) * TRIM_STEP;
         for (origin, text) in self.lines.iter().skip(from) {
             runs.push((format!("{}: {text}\n", origin.label()), false));
         }
@@ -802,6 +810,25 @@ mod tests {
         let all = s.transcript_text();
         assert!(all.contains("line 0"), "copying takes the whole call");
         assert!(all.ends_with(&format!("line {}", VIEW_LINES + 49)));
+    }
+
+    /// The oldest lines go fifty at a time, so the panel's text is not rebuilt
+    /// with every line of a long call.
+    #[test]
+    fn the_panel_drops_old_lines_in_steps() {
+        let mut s = State { mode: Mode::Recording, ..Default::default() };
+        for i in 0..(VIEW_LINES + 60) {
+            s.push_line(Origin::Mic, format!("line {i}"));
+        }
+        let shown = s.display_runs();
+        assert_eq!(shown.len(), VIEW_LINES + 10, "the window did not move for each of the last ten");
+        assert!(shown[0].0.contains("line 50:") || shown[0].0.ends_with("line 50\n"), "{:?}", shown[0]);
+        for i in (VIEW_LINES + 60)..(VIEW_LINES + 100) {
+            s.push_line(Origin::Mic, format!("line {i}"));
+        }
+        let shown = s.display_runs();
+        assert_eq!(shown.len(), VIEW_LINES, "and moved on in one step");
+        assert!(shown[0].0.ends_with("line 100\n"), "{:?}", shown[0]);
     }
 
     /// Every change to the transcript has to be visible as one, or the panel

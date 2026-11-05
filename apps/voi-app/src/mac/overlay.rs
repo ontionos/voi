@@ -1615,9 +1615,37 @@ impl Overlay {
             );
             self.head_len += NSString::from_str(added).length();
             self.committed_shown = head;
+        } else if let Some(cut) = head_changed.then(|| trimmed_front(&self.committed_shown, &head)).flatten() {
+            // The oldest lines went (see `TRIM_STEP` in state.rs), and maybe
+            // a phrase was added. Only what went is taken out, and the text
+            // is moved up by exactly its height in the same frame: the text
+            // is laid out from the top, so removing lines there would
+            // otherwise shift everything on screen by them — and rebuilding
+            // the whole document instead is what made a long call jerk and
+            // flicker with every line.
+            let before = self.text_height();
+            let cut_len = NSString::from_str(&self.committed_shown[..cut]).length();
+            storage.deleteCharactersInRange(NSRange::new(0, cut_len));
+            let removed = before - self.text_height();
+            self.scroll_y = (self.scroll_y - removed).max(0.0);
+            self.scroll_target = (self.scroll_target - removed).max(0.0);
+            self.head_len -= cut_len;
+
+            let kept = self.committed_shown[cut..].len();
+            let added = &head[kept..];
+            let doc = NSMutableAttributedString::new();
+            doc.appendAttributedString(&styled(added, 1.0, false));
+            doc.appendAttributedString(&live_doc);
+            let end = storage.length();
+            storage.replaceCharactersInRange_withAttributedString(
+                NSRange::new(self.head_len, end.saturating_sub(self.head_len)),
+                &doc,
+            );
+            self.head_len += NSString::from_str(added).length();
+            self.committed_shown = head;
         } else if head_changed {
-            // Only when the settled text is not simply longer than before —
-            // a new session, or history trimmed from the front.
+            // Only when the settled text is neither longer than before nor
+            // the same with its oldest lines gone: a new session.
             self.head_len = NSString::from_str(&head).length();
             let doc = NSMutableAttributedString::new();
             if !head.is_empty() {
@@ -1767,6 +1795,14 @@ impl Overlay {
             vis.origin.y + vis.size.height - size.height - MARGIN + PAD,
         ));
     }
+}
+
+/// Where `old`'s lines stop being dropped from its front, if `new` is `old`
+/// with whole lines taken from the front and perhaps more added at the end.
+fn trimmed_front(old: &str, new: &str) -> Option<usize> {
+    old.match_indices('\n')
+        .map(|(i, _)| i + 1)
+        .find(|&cut| new.starts_with(&old[cut..]))
 }
 
 /// Apply the reveal ramp across a slice of runs.
@@ -2014,6 +2050,23 @@ mod tests {
         assert_eq!(runs[0].0, "You: ");
         assert_eq!(runs[0].1, 1.0);
         assert!(runs[1].1 < 1.0, "the spoken word should still be fading");
+    }
+
+    /// Lines dropped from the front are found, so only they are taken out —
+    /// and whatever is cut, what is left plus what was added is the new text.
+    #[test]
+    fn lines_dropped_from_the_front_are_found() {
+        let old = "You: one\nThem: two\nYou: three\n";
+        let new = "You: three\nThem: four\n";
+        let cut = super::trimmed_front(old, new).unwrap();
+        assert_eq!(&old[cut..], "You: three\n");
+        assert_eq!(format!("{}{}", &old[cut..], &new[old.len() - cut..]), new);
+        // Repeated lines may match sooner; the text that results is the same.
+        let (old, new) = ("Yes.\nYes.\nYes.\n", "Yes.\nYes.\nNo.\n");
+        let cut = super::trimmed_front(old, new).unwrap();
+        assert_eq!(format!("{}{}", &old[cut..], &new[old.len() - cut..]), new);
+        // Something else entirely: everything goes.
+        assert_eq!(super::trimmed_front("You: a\n", "Them: b\n"), Some("You: a\n".len()));
     }
 
     #[test]

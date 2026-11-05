@@ -86,6 +86,13 @@ pub enum RecorderEvent {
     /// A finalized segment, already persisted.
     Segment(Segment),
     Warning { origin: Origin, message: String },
+    /// The [`Segment`]s and [`Pending`](RecorderEvent::Pending)s since the
+    /// last `Frame` are one update — everything one message from Soniox
+    /// changed — and are meant to reach the screen together. Applied one by
+    /// one, a display could draw the moment between them: a word just made
+    /// final shown twice, white and still in the grey tail, or a closed line
+    /// in neither place. That was the transcript flickering as words settled.
+    Frame,
     Finished(SessionMeta),
 }
 
@@ -301,6 +308,7 @@ pub fn spawn(cfg: RecorderConfig) -> Result<Recorder> {
                             })
                             .await;
                     }
+                    let _ = event_tx.send(RecorderEvent::Frame).await;
                     continue;
                 }
             };
@@ -422,6 +430,9 @@ pub fn spawn(cfg: RecorderConfig) -> Result<Recorder> {
                             start_ms: builder.open_start_ms(),
                         })
                         .await;
+                    // Soniox ends every message with its pending set: the
+                    // update this message made is complete.
+                    let _ = event_tx.send(RecorderEvent::Frame).await;
                 }
                 TranscriptEvent::Reconnecting { attempt } => {
                     let _ = event_tx

@@ -9,6 +9,19 @@ use std::collections::VecDeque;
 use voi_audio::Origin;
 use voi_core::Stopper;
 
+/// What a run of the panel's text is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shade {
+    /// A finished line, its label and its line break.
+    Settled,
+    /// A live line's label, and the break after it.
+    Label,
+    /// Words of a live line Soniox has made final: they will not change.
+    Open(Origin),
+    /// The live line's unstable tail, which may still be rewritten.
+    Tail(Origin),
+}
+
 /// How many settled lines the panel is given to show.
 ///
 /// Enough to scroll back through a good few screens of what was just said, and
@@ -362,6 +375,7 @@ impl State {
     ///
     /// Every line is prefixed with the speaker rather than only the ones where
     /// it changes: the panel scrolls, so any line can be the first one visible.
+    #[cfg_attr(target_os = "macos", allow(dead_code))] // the Windows panel's
     pub fn display_runs(&self) -> Vec<(String, bool)> {
         self.runs(VIEW_LINES)
     }
@@ -375,12 +389,12 @@ impl State {
     /// eighty per cent of the frame in here. Long before that the frame stops
     /// fitting in its sixteen milliseconds, the widget goes still and stops
     /// answering, and from the outside that is an app that died.
-    fn runs(&self, keep: usize) -> Vec<(String, bool)> {
-        let mut runs: Vec<(String, bool)> = Vec::new();
+    fn shaded(&self, keep: usize) -> Vec<(String, Shade)> {
+        let mut runs: Vec<(String, Shade)> = Vec::new();
         let over = self.lines.len().saturating_sub(keep);
         let from = (over / TRIM_STEP) * TRIM_STEP;
         for (origin, text) in self.lines.iter().skip(from) {
-            runs.push((format!("{}: {text}\n", origin.label()), false));
+            runs.push((format!("{}: {text}\n", origin.label()), Shade::Settled));
         }
 
         // Whichever line was begun first goes above the other, so the live
@@ -409,14 +423,14 @@ impl State {
                 (open.trim_start(), tail.as_str())
             };
 
-            runs.push((format!("{}: ", origin.label()), false));
+            runs.push((format!("{}: ", origin.label()), Shade::Label));
             if !open.is_empty() {
-                runs.push((open.to_string(), false));
+                runs.push((open.to_string(), Shade::Open(origin)));
             }
             if !tail.is_empty() {
-                runs.push((tail.to_string(), true));
+                runs.push((tail.to_string(), Shade::Tail(origin)));
             }
-            runs.push(("\n".to_string(), false));
+            runs.push(("\n".to_string(), Shade::Label));
         }
 
         // No newline on the end. An empty last line is still a line as far as
@@ -431,6 +445,26 @@ impl State {
             }
         }
         runs
+    }
+
+    /// The same as [`Self::shaded`], with only "is it the unstable tail" kept.
+    fn runs(&self, keep: usize) -> Vec<(String, bool)> {
+        self.shaded(keep).into_iter().map(|(text, shade)| (text, matches!(shade, Shade::Tail(_)))).collect()
+    }
+
+    /// What the Mac's panel draws: the runs with what each one is, so final
+    /// words can whiten smoothly instead of switching colour in one frame.
+    pub fn display_shaded(&self) -> Vec<(String, Shade)> {
+        self.shaded(VIEW_LINES)
+    }
+
+    /// When the line `origin` is on now began, on the audio's clock: which
+    /// live line a run belongs to.
+    pub fn live_since(&self, origin: Origin) -> Option<u64> {
+        match origin {
+            Origin::Mic => self.since_mic,
+            Origin::System => self.since_system,
+        }
     }
 
     /// Everything, for the Copy button — the whole call, not the part of it

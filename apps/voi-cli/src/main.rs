@@ -226,6 +226,8 @@ async fn listen(
                     // The terminal UI has no meter to drive.
                     RecorderEvent::Level { .. } => {}
                     RecorderEvent::Finished(meta) => finished = Some(meta),
+                    // The terminal draws each event as it comes; nothing to group.
+                    RecorderEvent::Frame => {}
                 }
             }
         }

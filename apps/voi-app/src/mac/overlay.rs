@@ -47,7 +47,8 @@ use objc2_foundation::{
 
 
 use crate::mac::meter::RED;
-use crate::state::Shared;
+use crate::state::{Shade, Shared};
+use voi_audio::Origin;
 
 /// Transparent margin around the glass, for the edge sweep to spill into.
 ///
@@ -941,8 +942,12 @@ pub struct Overlay {
     laid_out_appear: f64,
     /// The transcript as the panel last built it, and the revision it was
     /// built from. Rebuilt when the words change, not when a frame elapses.
-    runs: Vec<(String, bool)>,
+    runs: Vec<(String, Shade)>,
     revision: u64,
+    /// Per side, how far along its live line the words have turned white, in
+    /// characters of its final text (see [`WHITEN`]): the line it belongs to,
+    /// and the eased position.
+    white: [(Option<u64>, f64); 2],
     /// Eased presence of the "Record?" prompt.
     prompt: f64,
     /// How far the widget has arrived on screen, 0.0–1.0.
@@ -1158,6 +1163,7 @@ impl Overlay {
             laid_out_tint: -1.0,
             laid_out_appear: -1.0,
             runs: Vec::new(),
+            white: [(None, 0.0); 2],
             revision: u64::MAX,
             prompt: 0.0,
             appear: 0.0,
@@ -1386,8 +1392,12 @@ impl Overlay {
         };
         if revision != self.revision {
             self.revision = revision;
-            self.runs = shared.lock().unwrap().display_runs();
+            self.runs = shared.lock().unwrap().display_shaded();
         }
+        let since = {
+            let s = shared.lock().unwrap();
+            [s.live_since(Origin::Mic), s.live_since(Origin::System)]
+        };
 
         // Arriving and leaving are the same animation run in either direction:
         // fading and growing into place. It used to be ordered in at full size
@@ -1487,7 +1497,7 @@ impl Overlay {
         // staying half-transparent once speech pauses.
         let live_chars: usize = runs
             .iter()
-            .filter(|(_, live)| *live)
+            .filter(|(_, shade)| matches!(shade, Shade::Tail(_)))
             .map(|(text, _)| text.chars().count())
             .sum();
         let target = live_chars as f64 + FADE;
@@ -1497,6 +1507,17 @@ impl Overlay {
         self.reveal += (target - self.reveal) * 0.08;
         if target - self.reveal < 0.05 {
             self.reveal = target;
+        }
+
+        // Words made final turn white from left to right, never back — see
+        // `whiten`.
+        for (side, origin) in [Origin::Mic, Origin::System].into_iter().enumerate() {
+            let final_chars: usize = runs
+                .iter()
+                .filter(|(_, shade)| *shade == Shade::Open(origin))
+                .map(|(text, _)| text.chars().count())
+                .sum();
+            self.white[side] = whiten(self.white[side], since[side], final_chars);
         }
 
 
@@ -1581,12 +1602,17 @@ impl Overlay {
     /// Only the region from the first live run onward is rewritten each frame.
     /// Rebuilding the whole document at 60 fps would cost more with every
     /// minute of the call.
-    fn render(&mut self, runs: &[(String, bool)]) {
-        let split = runs.iter().position(|(_, live)| *live).unwrap_or(runs.len());
+    fn render(&mut self, runs: &[(String, Shade)]) {
+        // Finished lines are written once and kept; the live lines after them
+        // are drawn again whenever they change, as they fade in and whiten.
+        let split = runs.iter().position(|(_, shade)| *shade != Shade::Settled).unwrap_or(runs.len());
         let head: String = runs[..split].iter().map(|(t, _)| t.as_str()).collect();
-        let live_runs = faded(&runs[split..], self.reveal);
+        let white = self.white;
+        let cursor = |origin: Origin| white[if origin == Origin::Mic { 0 } else { 1 }].1;
+        let live_runs = faded(&runs[split..], self.reveal, &cursor);
 
-        let key = format!("{:.2}|{}", self.reveal, runs.len());
+        let live_text: String = runs[split..].iter().map(|(t, _)| t.as_str()).collect();
+        let key = format!("{:.2}|{:.2}|{:.2}|{}|{live_text}", self.reveal, white[0].1, white[1].1, runs.len());
         let head_changed = head != self.committed_shown;
         if !head_changed && key == self.tail_shown {
             return;
@@ -1595,8 +1621,8 @@ impl Overlay {
         let Some(storage) = (unsafe { self.transcript.textStorage() }) else { return };
 
         let live_doc = NSMutableAttributedString::new();
-        for (text, alpha, live) in &live_runs {
-            live_doc.appendAttributedString(&styled(text, *alpha, *live));
+        for (text, alpha, whiteness) in &live_runs {
+            live_doc.appendAttributedString(&styled(text, *alpha, *whiteness));
         }
 
         if head_changed && head.starts_with(&self.committed_shown) {
@@ -1605,7 +1631,7 @@ impl Overlay {
             // is what made the text visibly jump when a sentence finished.
             let added = &head[self.committed_shown.len()..];
             let doc = NSMutableAttributedString::new();
-            doc.appendAttributedString(&styled(added, 1.0, false));
+            doc.appendAttributedString(&styled(added, 1.0, 1.0));
             doc.appendAttributedString(&live_doc);
 
             let end = storage.length();
@@ -1634,7 +1660,7 @@ impl Overlay {
             let kept = self.committed_shown[cut..].len();
             let added = &head[kept..];
             let doc = NSMutableAttributedString::new();
-            doc.appendAttributedString(&styled(added, 1.0, false));
+            doc.appendAttributedString(&styled(added, 1.0, 1.0));
             doc.appendAttributedString(&live_doc);
             let end = storage.length();
             storage.replaceCharactersInRange_withAttributedString(
@@ -1649,7 +1675,7 @@ impl Overlay {
             self.head_len = NSString::from_str(&head).length();
             let doc = NSMutableAttributedString::new();
             if !head.is_empty() {
-                doc.appendAttributedString(&styled(&head, 1.0, false));
+                doc.appendAttributedString(&styled(&head, 1.0, 1.0));
             }
             doc.appendAttributedString(&live_doc);
             storage.setAttributedString(&doc);
@@ -1805,33 +1831,75 @@ fn trimmed_front(old: &str, new: &str) -> Option<usize> {
         .find(|&cut| new.starts_with(&old[cut..]))
 }
 
-/// Apply the reveal ramp across a slice of runs.
+/// How many characters wide the edge between white and grey is, as final
+/// words whiten.
+const WHITEN: f64 = 4.0;
+
+/// One side's whitening, a frame on: `(line, position)` given the line it is
+/// on now and how many of its characters are final.
 ///
-/// Only characters in live runs fade; settled runs mixed in among them stay
-/// opaque. Alpha is quantised so a long tail becomes a handful of runs rather
-/// than one per character.
-fn faded(runs: &[(String, bool)], reveal: f64) -> Vec<(String, f64, bool)> {
+/// The position eases toward the end of the final text, so words Soniox has
+/// settled turn white from left to right over a tenth of a second instead of
+/// switching colour in one frame, and it never moves back within a line: a
+/// word that is final stays white. A line that continues under a new start —
+/// cut where the other side spoke — keeps its words white; only a line with
+/// nothing final yet starts again from grey.
+fn whiten((line, position): (Option<u64>, f64), since: Option<u64>, final_chars: usize) -> (Option<u64>, f64) {
+    let target = final_chars as f64 + WHITEN;
+    if final_chars == 0 || since.is_none() {
+        return (None, 0.0);
+    }
+    if line.is_some() && line != since {
+        return (since, target);
+    }
+    let rate = 1.0 - (-(1.0 / 60.0) / 0.06f64).exp();
+    let mut position = position.min(target);
+    position += (target - position) * rate;
+    if target - position < 0.05 {
+        position = target;
+    }
+    (since, position)
+}
+
+/// Apply the reveal ramp and the whitening across a slice of runs:
+/// `(text, alpha, whiteness)`, whiteness 0 grey to 1 white.
+///
+/// Only the unstable tail fades in, and only final words whiten; labels and
+/// line breaks are structure, opaque and white. Both are quantised so a line
+/// becomes a handful of runs rather than one per character.
+fn faded(runs: &[(String, Shade)], reveal: f64, white: &dyn Fn(Origin) -> f64) -> Vec<(String, f64, f64)> {
     const STEPS: f64 = 10.0;
+    let q = |v: f64| (v.clamp(0.0, 1.0) * STEPS).round() / STEPS;
 
-    let mut out: Vec<(String, f64, bool)> = Vec::new();
-    let mut live_index = 0usize;
+    let mut out: Vec<(String, f64, f64)> = Vec::new();
+    let push = |out: &mut Vec<(String, f64, f64)>, ch: char, alpha: f64, whiteness: f64| match out.last_mut() {
+        Some((t, a, w)) if (*a - alpha).abs() < f64::EPSILON && (*w - whiteness).abs() < f64::EPSILON => t.push(ch),
+        _ => out.push((ch.to_string(), alpha, whiteness)),
+    };
+    let mut tail_index = 0usize;
+    let mut final_index = [0usize; 2];
 
-    for (text, live) in runs {
-        if !*live {
-            // Speaker labels and newlines are structure, not speech.
-            out.push((text.clone(), 1.0, false));
-            continue;
-        }
-        for ch in text.chars() {
-            let alpha = ((reveal - live_index as f64) / FADE).clamp(0.0, 1.0);
-            live_index += 1;
-            if alpha <= 0.0 {
-                return out;
+    for (text, shade) in runs {
+        match shade {
+            Shade::Settled | Shade::Label => out.push((text.clone(), 1.0, 1.0)),
+            Shade::Open(origin) => {
+                let side = if *origin == Origin::Mic { 0 } else { 1 };
+                let position = white(*origin);
+                for ch in text.chars() {
+                    let whiteness = (position - final_index[side] as f64) / WHITEN;
+                    final_index[side] += 1;
+                    push(&mut out, ch, 1.0, q(whiteness));
+                }
             }
-            let quantised = (alpha * STEPS).round() / STEPS;
-            match out.last_mut() {
-                Some((t, a, l)) if *l && (*a - quantised).abs() < f64::EPSILON => t.push(ch),
-                _ => out.push((ch.to_string(), quantised, true)),
+            Shade::Tail(_) => {
+                for ch in text.chars() {
+                    let alpha = ((reveal - tail_index as f64) / FADE).clamp(0.0, 1.0);
+                    tail_index += 1;
+                    if alpha <= 0.0 {
+                        return out;
+                    }
+                    push(&mut out, ch, q(alpha), 0.0);
+                }
             }
         }
     }
@@ -1858,12 +1926,10 @@ pub fn transcript_font_of(size: f64) -> Retained<NSFont> {
 
 /// One styled run. `live` text sits a shade dimmer than settled text, so you
 /// can see at a glance which words may still change.
-fn styled(text: &str, alpha: f64, live: bool) -> Retained<NSAttributedString> {
-    let color = if live {
-        NSColor::colorWithSRGBRed_green_blue_alpha(0.74, 0.77, 0.81, alpha)
-    } else {
-        NSColor::colorWithSRGBRed_green_blue_alpha(0.95, 0.96, 0.98, alpha)
-    };
+fn styled(text: &str, alpha: f64, whiteness: f64) -> Retained<NSAttributedString> {
+    // From the provisional grey to the settled white.
+    let mix = |grey: f64, white: f64| grey + (white - grey) * whiteness.clamp(0.0, 1.0);
+    let color = NSColor::colorWithSRGBRed_green_blue_alpha(mix(0.74, 0.95), mix(0.77, 0.96), mix(0.81, 0.98), alpha);
     let font = transcript_font();
     let attrs = NSDictionary::from_slices(
         &[unsafe { objc2_app_kit::NSForegroundColorAttributeName }, unsafe {
@@ -2024,7 +2090,7 @@ mod tests {
     /// Characters at the head must ramp in, not appear at full strength.
     #[test]
     fn the_newest_characters_fade_in() {
-        let runs = faded(&[("abcdefghij".to_string(), true)], 4.0);
+        let runs = faded(&[("abcdefghij".to_string(), Shade::Tail(Origin::Mic))], 4.0, &|_| 0.0);
         let joined: String = runs.iter().map(|(t, _, _)| t.as_str()).collect();
         assert_eq!(joined, "abcd", "nothing past the reveal head may show");
 
@@ -2037,7 +2103,7 @@ mod tests {
     /// Once the reveal has run past the end, nothing may stay half-faded.
     #[test]
     fn a_settled_tail_is_fully_opaque() {
-        let runs = faded(&[("hello".to_string(), true)], 5.0 + FADE);
+        let runs = faded(&[("hello".to_string(), Shade::Tail(Origin::Mic))], 5.0 + FADE, &|_| 0.0);
         assert!(runs.iter().all(|(_, a, _)| *a >= 0.99), "settled text must not stay dim");
         assert_eq!(runs.len(), 1);
     }
@@ -2046,7 +2112,7 @@ mod tests {
     /// opaque even while the words beside them are still fading in.
     #[test]
     fn settled_runs_among_live_ones_stay_opaque() {
-        let runs = faded(&[("You: ".to_string(), false), ("hi".to_string(), true)], 1.0);
+        let runs = faded(&[("You: ".to_string(), Shade::Label), ("hi".to_string(), Shade::Tail(Origin::Mic))], 1.0, &|_| 0.0);
         assert_eq!(runs[0].0, "You: ");
         assert_eq!(runs[0].1, 1.0);
         assert!(runs[1].1 < 1.0, "the spoken word should still be fading");
@@ -2071,7 +2137,38 @@ mod tests {
 
     #[test]
     fn nothing_is_revealed_at_the_start() {
-        assert!(faded(&[("hello".to_string(), true)], 0.0).is_empty());
+        assert!(faded(&[("hello".to_string(), Shade::Tail(Origin::Mic))], 0.0, &|_| 0.0).is_empty());
+    }
+
+    /// Final words whiten from left to right: white behind the edge, grey
+    /// ahead of it, a short ramp between.
+    #[test]
+    fn final_words_whiten_from_the_left() {
+        let runs = faded(&[("abcdefgh".to_string(), Shade::Open(Origin::Mic))], 0.0, &|_| 4.0);
+        let first = runs.first().unwrap();
+        let last = runs.last().unwrap();
+        assert_eq!(first.2, 1.0, "{runs:?}");
+        assert_eq!(last.2, 0.0, "{runs:?}");
+        let all: String = runs.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(all, "abcdefgh", "final text is always shown");
+    }
+
+    /// The whitening eases forward, reaches the end, and never goes back while
+    /// the line is the same; a new line with nothing final starts grey; a line
+    /// cut and continued keeps its words white.
+    #[test]
+    fn whitening_moves_forward_only() {
+        let mut w = super::whiten((None, 0.0), Some(1_000), 5);
+        let mut last = w.1;
+        for _ in 0..30 {
+            w = super::whiten(w, Some(1_000), 5);
+            assert!(w.1 >= last, "never backwards");
+            last = w.1;
+        }
+        assert_eq!(w.1, 5.0 + WHITEN, "and it arrives");
+        assert!(super::whiten((None, 0.0), Some(1_000), 5).1 < 5.0, "not all at once");
+        assert_eq!(super::whiten(w, None, 0), (None, 0.0), "nothing final: grey again");
+        assert_eq!(super::whiten(w, Some(9_000), 3), (Some(9_000), 3.0 + WHITEN), "a continued line stays white");
     }
 }
 

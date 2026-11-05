@@ -123,19 +123,31 @@ pub fn start(shared: &Shared) {
             s.stopper = Some(recorder.stopper());
         }
 
-        while let Some(event) = recorder.events.recv().await {
+        // Lines and live text wait for the end of the update they belong to
+        // and go on screen together (see RecorderEvent::Frame) — or after
+        // FRAME_WAIT, should an end never come.
+        const FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+        let mut held: Vec<RecorderEvent> = Vec::new();
+        loop {
+            let event = if held.is_empty() {
+                recorder.events.recv().await
+            } else {
+                match tokio::time::timeout(FRAME_WAIT, recorder.events.recv()).await {
+                    Ok(event) => event,
+                    Err(_) => Some(RecorderEvent::Frame),
+                }
+            };
+            let Some(event) = event else { break };
+            if matches!(event, RecorderEvent::Segment(_) | RecorderEvent::Pending { .. }) {
+                held.push(event);
+                continue;
+            }
             let mut s = shared.lock().unwrap();
+            for held in held.drain(..) {
+                apply_text(&mut s, held);
+            }
             match event {
                 RecorderEvent::Started { dir, .. } => s.session_dir = Some(dir),
-                RecorderEvent::Segment(seg) => {
-                    s.segments += 1;
-                    s.last_line = seg.text.clone();
-                    s.push_line(seg.origin, seg.text);
-                    s.set_pending(seg.origin, String::new(), String::new(), None);
-                }
-                RecorderEvent::Pending { origin, settled, tail, start_ms } => {
-                    s.set_pending(origin, settled, tail, start_ms);
-                }
                 RecorderEvent::Level { origin, level } => match origin {
                     voi_audio::Origin::Mic => s.level_mic = level,
                     voi_audio::Origin::System => s.level_system = level,
@@ -156,6 +168,9 @@ pub fn start(shared: &Shared) {
         }
 
         let mut s = shared.lock().unwrap();
+        for held in held.drain(..) {
+            apply_text(&mut s, held);
+        }
         s.mode = Mode::Idle;
         s.started_at = None;
         s.stopper = None;
@@ -163,6 +178,22 @@ pub fn start(shared: &Shared) {
         s.level_system = 0.0;
         s.clear_pending();
     });
+}
+
+/// A finished line or the live text, onto the state the panels draw.
+fn apply_text(s: &mut crate::state::State, event: RecorderEvent) {
+    match event {
+        RecorderEvent::Segment(seg) => {
+            s.segments += 1;
+            s.last_line = seg.text.clone();
+            s.push_line(seg.origin, seg.text);
+            s.set_pending(seg.origin, String::new(), String::new(), None);
+        }
+        RecorderEvent::Pending { origin, settled, tail, start_ms } => {
+            s.set_pending(origin, settled, tail, start_ms);
+        }
+        _ => {}
+    }
 }
 
 /// Transcribe a recording that already exists, reporting progress as the
